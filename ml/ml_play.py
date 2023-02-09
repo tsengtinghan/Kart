@@ -2,27 +2,13 @@ import logging
 import os # you can use functions in logging: debug, info, warning, error, critical, log
 from config import ENV
 import PAIA
-#from demo import Demo
 import cv2
 import numpy as np
-from dqn_model import DQN
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import collections
-
-# from getkey import getkey, keys
-
-GAMMA = 0.99
-BATCH_SIZE = 32
-REPLAY_SIZE = 10000
-LEARNING_RATE = 1e-4
-SYNC_TARGET_FRAMES = 1000
-REPLAY_START_SIZE = 32
-
-EPSILON_DECAY_LAST_FRAME = 10**4
-EPSILON_START = 1.0
-EPSILON_FINAL = 0.02
+from dqn_model import QNet
 
 Experience = collections.namedtuple('Experience', field_names=['state', 'action', 'reward', 'done', 'new_state'])
 class ExperienceBuffer:
@@ -41,32 +27,107 @@ class ExperienceBuffer:
         return np.array(states), np.array(actions), np.array(rewards, dtype=np.float32), \
                np.array(dones, dtype=np.uint8), np.array(next_states)
 
+class DeepQNetwork():
+    def __init__(
+        self,
+        n_actions,
+        input_shape,
+        qnet,
+        device,
+        learning_rate = 2e-4,
+        reward_decay = 0.99,
+        replace_target_iter = 1000,
+        memory_size = 10000,
+        batch_size = 32,
+    ):
+        # initialize parameters
+        self.n_actions = n_actions
+        self.input_shape = input_shape
+        self.lr = learning_rate
+        self.gamma = reward_decay
+        self.replace_target_iter = replace_target_iter
+        self.memory_size = memory_size
+        self.batch_size = batch_size
+        self.device = device
+        self.learn_step_counter = 0
+        self.exp_buffer = ExperienceBuffer(memory_size)
+
+        # Network
+        self.net = qnet(self.input_shape, self.n_actions).to(self.device)
+        self.tgt_net = qnet(self.input_shape, self.n_actions).to(self.device)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr)
+
+    def calc_loss(self):
+        states, actions, rewards, dones, next_states = self.exp_buffer.sample(self.batch_size)
+
+        states_v = torch.tensor(np.array(states, copy=False)).to(self.device)
+        next_states_v = torch.tensor(np.array(next_states, copy=False)).to(self.device)
+        actions_v = torch.tensor(actions).to(self.device)
+        rewards_v = torch.tensor(rewards).to(self.device)
+        done_mask = torch.BoolTensor(dones).to(self.device)
+
+        state_action_values = self.net(states_v.float()).gather( 1, actions_v.unsqueeze(-1).type(torch.int64)).squeeze(-1)
+        with torch.no_grad():
+            next_state_values = self.tgt_net(next_states_v.float()).max(1)[0]
+            next_state_values[done_mask] = 0.0
+            next_state_values = next_state_values.detach()
+
+        expected_state_action_values = next_state_values * self.gamma + rewards_v
+        return nn.MSELoss()(state_action_values, expected_state_action_values)
+
+    def choose_action(self, state, epsilon=0):
+        if np.random.random() < epsilon:
+            act_v = np.random.randint(self.n_actions)
+        else:
+            state_v = torch.tensor([state]).to(self.device)
+            q_vals_v = self.net(state_v.float())
+            _, act_v = torch.max(q_vals_v, dim=1)
+        action = int(act_v)
+        return action
+
+    def learn(self):
+        # check to replace target parameters
+        if len(self.exp_buffer)>=self.batch_size:
+            if self.learn_step_counter % self.replace_target_iter == 0:
+                self.tgt_net.load_state_dict(self.net.state_dict())
+            self.optimizer.zero_grad()
+            loss_t = self.calc_loss()
+            loss_t.backward()
+            self.optimizer.step()
+        self.learn_step_counter += 1
+
+    def store_transition(self, s, a, r, d, s_):
+        exp = Experience(s, a, r, d, s_)
+        self.exp_buffer.append(exp)
+    
+    def save_model(self):
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model.dat")
+        torch.save(self.net.state_dict(), model_path)
+
+def epsilon_compute(frame_id, epsilon_max=1.0, epsilon_min=0.02, epsilon_decay=750):
+    return max(epsilon_min, epsilon_max - frame_id / epsilon_decay)
+
 
 
 class MLPlay:
     def __init__(self):
         #self.demo = Demo.create_demo() # create a replay buffer
-        global EPSILON_START
-        self.step_number = 0 # Count the step, not necessarily
-        self.episode_number = 1 # Count the episode, not necessarily
-        self.action = 1
-        self.state = [] 
-        self.state_n = []
-        self.device = 'cpu'
-        self.net = DQN((4,28,63), 3).to(self.device)
-        self.tgt_net = DQN((4,28,63), 3).to(self.device)
-        self.exp_buffer = ExperienceBuffer(REPLAY_SIZE)
-        self.epsilon = EPSILON_START
-        self.frame_idx = 0
-        self.optimizer = optim.Adam(self.net.parameters(), lr=LEARNING_RATE)
-        self.cnt = 0
+        self.episode_number = 1
+        self.epsilon = 1.0
         self.progress = 0
         self.total_rewards = []
         self.best_mean = 0
-        self.velocity = 0
-        self.distance = 0
+        # TODO create any variables you need **********************************************************************#
+        self.state = []
+        
+        self.step = 0
+        self.action = 1
+        self.next_state = []
+        # self.exp_buffer = ExperienceBuffer(10000)
+        self.cnt_zero = 0
+        self.frame_id = 0
 
-
+        #**********************************************************************************************************#
 
     def decision(self, state: PAIA.State) -> PAIA.Action:
         '''
@@ -78,109 +139,134 @@ class MLPlay:
         #       state.observation.images.front.data and 
         #       state.observation.images.back.data to numpy array (range from 0 to 1)
         #       For example: img_array = PAIA.image_to_array(state.observation.images.front.data)
+        
+
+        # TODO Reinforcement Learning Algorithm *******************************************************************#
+        # 1. Preprocess
+        # 2. Design state, action, reward, next_state by yourself
+        # 3. Store the datas into ReplayedBuffer
+        # 4. Update Epsilon value
+        # 5. Train Q-Network
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dqn = DeepQNetwork(
+            n_actions = 3,
+            input_shape =[4 ,*(63,28)],
+            qnet = QNet,
+            device = device,
+            learning_rate = 2e-4, 
+            reward_decay = 0.99,
+            replace_target_iter = 1000, 
+            memory_size = 10000,
+            batch_size = 32,
+        )
+
         MAX_EPISODES = int(ENV.get('MAX_EPISODES') or -1)
         if state.observation.images.front.data:
-            img_array = PAIA.image_to_array(state.observation.images.front.data)
+            img_array = PAIA.image_to_array(state.observation.images.front.data) #img_array.shape = (112, 252, 3)
+            # TODO Image Preprocessing ****************#
+            # Hint: 
+            #      GrayScale: img  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            #      Resize:    img  = cv2.resize(img, (width, height))
             img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
             img_array = cv2.resize(img_array, (63, 28))
-            #cv2.imshow("img",img_array)
-            #cv2.waitKey(20)
+            self.frame_id += 1
+            # ****************************************#
         else:
             img_array = None
 
+        self.step += 1
+        self.next_state.append(img_array)
 
-        self.step_number += 1
-        self.state_n.append(img_array)
+        
 
-        if len(self.exp_buffer)>=REPLAY_START_SIZE:
-            if self.frame_idx % SYNC_TARGET_FRAMES == 0:
-                self.tgt_net.load_state_dict(self.net.state_dict())
-            self.optimizer.zero_grad()
-            loss_t = self.calc_loss()
-            loss_t.backward()
-            self.optimizer.step()
+        if(self.step > 55 and self.step % 4 == 0):
+            reward = 0
+            dqn.learn()
+            if state.observation.progress > self.progress:
+                reward += (state.observation.progress - self.progress)*1000
+                self.progress = state.observation.progress
+            print(reward)
+
+            if(reward < 0.1): self.cnt_zero += 1
+            else: self.cnt_zero = 0
+
+            dqn.store_transition(self.state, self.action, reward, False, self.next_state)
+
+        if(self.step % 4 == 0):
+            self.state = self.next_state.copy()
+            self.next_state = []
+            
+            self.epsilon = epsilon_compute(self.episode) #?
+
+            # if(np.random.random() < self.epsilon):
+            #     self.action = np.random.randint(3)
+            # else:
+            #     self.state = choose_action(?)
+            
+            self.action = dqn.choose_action(self.state, self.epsilon)
             
 
 
-        if self.step_number >= 80 and self.step_number % 4 == 0:
-            reward = 0
-            if state.observation.progress > self.progress:
-                reward += (state.observation.progress - self.progress)*10000
-                self.progress = state.observation.progress
-            if state.observation.velocity > self.velocity:
-                reward += (state.observation.velocity - self.velocity)*1000
-                self.velocity = state.observation.velocity
-            if state.observation.rays.F.distance > 0.5:
-                reward += (state.observation.rays.F.distance)*100
-            print(reward)
-            if reward < 0.1:
-                self.cnt += 1
-            else:
-                self.cnt = 0
-            exp = Experience(self.state, self.action, reward, False, self.state_n)
-            self.exp_buffer.append(exp)
-        
-        if self.step_number % 4 == 0:
-            self.state =  self.state_n.copy()
-            self.state_n = []
 
-        if self.step_number % 4 == 0:
-            self.frame_idx += 1
-            self.epsilon = max(EPSILON_FINAL, EPSILON_START - self.frame_idx / EPSILON_DECAY_LAST_FRAME)
-            if np.random.random() < self.epsilon:
-                act_v = np.random.randint(3)
-            else:
-                state_v = torch.tensor([self.state]).to(self.device)
-                q_vals_v = self.net(state_v.float())
-                _, act_v = torch.max(q_vals_v, dim=1)
-            self.action = int(act_v)
 
-        #key = getkey()
-        #if key == keys.W:
-        #    self.action = 1
-        #elif key == keys.A:
-        #    self.action = 0
-        #elif key == keys.D:
-        #    self.action = 2
 
-        #logging.info('Epispde: ' + str(self.episode_number) + ', Step: ' + str(self.step_number) + ', Epsilon: ' + str(self.epsilon))
+
+
+
+
+
+        #*********************************************************************************************************#
+
 
         action = PAIA.create_action_object(acceleration=True, brake=False, steering=0.0)
-        if MAX_EPISODES > 0 and self.episode_number < MAX_EPISODES and self.cnt>10:
-            self.cnt = 0
+        if MAX_EPISODES > 0 and self.episode_number < MAX_EPISODES and self.cnt_zero>50:
+            self.cnt_zero = 0
             self.total_rewards.append(self.progress)
             logging.info('Epispde: ' + str(self.episode_number)+ ', Epsilon: ' + str(self.epsilon) + ', Progress: %.3f' %self.progress )
             mean_reward = np.mean(self.total_rewards[-30:])
             if self.best_mean < mean_reward:
                 print("Best mean reward updated %.3f -> %.3f, model saved" % (self.best_mean, mean_reward))
-                model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model.dat")
-                torch.save(self.net.state_dict(), model_path)
+                dqn.save_model()
                 self.best_mean = mean_reward
 
             action = PAIA.create_action_object(command=PAIA.Command.COMMAND_RESTART)
-
         elif state.event == PAIA.Event.EVENT_NONE:
             # Continue the game
-            # You can decide your own action (change the following action to yours)
-            if(self.action==0):
-                action = PAIA.create_action_object(acceleration=False, brake=False, steering=-1.0)
-            elif(self.action==1):
-                action = PAIA.create_action_object(acceleration=True, brake=False, steering=0.0)
-            elif(self.action==2):
-                action = PAIA.create_action_object(acceleration=False, brake=False, steering=1.0)
-            #action = PAIA.create_action_object(acceleration=True, brake=False, steering=0.0)
+
+            # TODO You can decide your own action (change the following action to yours) *****************************#
+            if(self.action == 1): action = PAIA.create_action_object(acceleration=True, brake=False, steering=0.0)
+            elif(self.action == 2): action = PAIA.create_action_object(acceleration=True, brake=False, steering=-1.0)
+            elif(self.action == 3): action = PAIA.create_action_object(acceleration=True, brake=False, steering=1.0)
+            
+           # action = PAIA.create_action_object(acceleration=True, brake=False, steering=0.0)
+
+
+
+
+            #*********************************************************************************************************#
+
             # You can save the step to the replay buffer (self.demo)
             #self.demo.create_step(state=state, action=action)
         elif state.event == PAIA.Event.EVENT_RESTART:
             # You can do something when the game restarts by someone
             # You can decide your own action (change the following action to yours)
-            self.step_number = 0
+
+            # TODO Do anything you want when the game reset *********************************************************#
             self.episode_number += 1
             self.action = 1
             self.state = []
-            self.state_n = []
-            self.cnt = 0
+            self.step = 0
             self.progress = 0
+            
+            self.next_state = []
+            
+            self.cnt_zero = 0
+
+
+
+
+            #*********************************************************************************************************#
+
             # You can start a new episode and save the step to the replay buffer (self.demo)
             #self.demo.create_episode()
             #self.demo.create_step(state=state, action=action)
@@ -205,29 +291,15 @@ class MLPlay:
             mean_reward = np.mean(self.total_rewards[-30:])
             if self.best_mean < mean_reward:
                 print("Best mean reward updated %.3f -> %.3f, model saved" % (self.best_mean, mean_reward))
-                model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model.dat")
-                torch.save(self.net.state_dict(), model_path)
                 self.best_mean = mean_reward
+                # TODO save your model ***********************************************#
+
+                dqn.save_model()
+                #********************************************************************#
+
         
         ##logging.debug(PAIA.action_info(action))
         return action
-    def calc_loss(self):
-        states, actions, rewards, dones, next_states = self.exp_buffer.sample(BATCH_SIZE)
-
-        states_v = torch.tensor(np.array( states, copy=False)).to(self.device)
-        next_states_v = torch.tensor(np.array( next_states, copy=False)).to(self.device)
-        actions_v = torch.tensor(actions).to(self.device)
-        rewards_v = torch.tensor(rewards).to(self.device)
-        done_mask = torch.BoolTensor(dones).to(self.device)
-
-        state_action_values = self.net(states_v.float()).gather( 1, actions_v.unsqueeze(-1).type(torch.int64)).squeeze(-1)
-        with torch.no_grad():
-            next_state_values = self.tgt_net(next_states_v.float()).max(1)[0]
-            next_state_values[done_mask] = 0.0
-            next_state_values = next_state_values.detach()
-
-        expected_state_action_values = next_state_values * GAMMA + rewards_v
-        return nn.MSELoss()(state_action_values, expected_state_action_values)
     
     def autosave(self):
         '''
